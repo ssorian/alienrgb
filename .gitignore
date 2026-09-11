@@ -1,0 +1,7 @@
+# Rust build output
+/target/
+/tests/.target/
+
+# Local analysis and Pi runtime state
+/.codegraph/
+.atl/

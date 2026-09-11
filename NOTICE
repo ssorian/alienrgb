@@ -1,0 +1,7 @@
+alienrgb includes protocol constants and Alienware m16 R2 target mappings translated from T-Troll/alienfx-tools:
+https://github.com/T-Troll/alienfx-tools
+
+alienfx-tools is MIT licensed:
+Copyright (c) 2020 Rik Lain
+
+The full upstream MIT license text is reproduced in LICENSE. No GPL-licensed local source was used for this work.
