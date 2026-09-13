@@ -1,0 +1,70 @@
+#!/bin/sh
+set -eu
+
+LC_ALL=C
+export LC_ALL
+
+ALIENRGB=/usr/local/bin/alienrgb
+MAX_READINESS_ATTEMPTS=15
+
+fail()
+{
+    printf '%s\n' "alienrgb-resume: $*" >&2
+    exit 1
+}
+
+uid=$(id -u) || fail "cannot determine the service user"
+[ "$uid" -ne 0 ] || fail "refusing to run alienrgb restoration as root"
+
+if [ -n "${XDG_STATE_HOME:-}" ]; then
+    case $XDG_STATE_HOME in
+        /*) state_file=$XDG_STATE_HOME/alienrgb/last-set-all-color ;;
+        *) fail "XDG_STATE_HOME must be an absolute path" ;;
+    esac
+elif [ -n "${HOME:-}" ]; then
+    case $HOME in
+        /*) state_file=$HOME/.local/state/alienrgb/last-set-all-color ;;
+        *) fail "HOME must be an absolute path" ;;
+    esac
+else
+    fail "cannot resolve state path because neither XDG_STATE_HOME nor HOME is set"
+fi
+
+if [ ! -e "$state_file" ] && [ ! -L "$state_file" ]; then
+    exit 0
+fi
+[ ! -L "$state_file" ] || fail "state file must not be a symbolic link: $state_file"
+[ -f "$state_file" ] || fail "state path is not a regular file: $state_file"
+
+byte_count=$(wc -c < "$state_file") || fail "cannot read state file: $state_file"
+[ "$byte_count" -eq 7 ] || fail "state must contain exactly six lowercase hexadecimal digits and one newline"
+IFS= read -r color < "$state_file" || fail "state must end with a newline"
+[ "${#color}" -eq 6 ] || fail "state color must contain exactly six digits"
+case $color in
+    *[!0123456789abcdef]*) fail "state color is not canonical lowercase hexadecimal" ;;
+esac
+
+attempt=1
+ready=false
+while [ "$attempt" -le "$MAX_READINESS_ATTEMPTS" ]; do
+    if report=$("$ALIENRGB" doctor --json 2>/dev/null) \
+        && printf '%s\n' "$report" \
+            | grep -Eq '^[[:space:]]*"ready_for_writes"[[:space:]]*:[[:space:]]*true[[:space:]]*,?[[:space:]]*$'; then
+        ready=true
+        break
+    fi
+    if [ "$attempt" -lt "$MAX_READINESS_ATTEMPTS" ]; then
+        sleep 1
+    fi
+    attempt=$((attempt + 1))
+done
+
+[ "$ready" = true ] || fail "hardware did not become ready after $MAX_READINESS_ATTEMPTS read-only checks"
+
+exec "$ALIENRGB" set-all \
+    --color "$color" \
+    --apply \
+    --experimental \
+    --confirm-live-write \
+    --confirm-power-profile-write \
+    --confirm-set-all-write
