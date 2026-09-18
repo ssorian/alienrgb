@@ -75,12 +75,33 @@ impl Drop for AwElcExecutionGuard {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BackendError {
-    code: &'static str,
+    code: String,
 }
 
 impl BackendError {
-    pub(crate) const fn new(code: &'static str) -> Self {
-        Self { code }
+    pub(crate) fn new(code: impl Into<String>) -> Self {
+        Self { code: code.into() }
+    }
+
+    pub(crate) fn combined(primary: Self, cleanup: Self) -> Self {
+        Self::new(format!(
+            "{}; cleanup failed ({})",
+            primary.code, cleanup.code
+        ))
+    }
+
+    pub(crate) fn from_cleanup_failures(failures: Vec<Self>) -> Result<(), Self> {
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Self::new(
+                failures
+                    .into_iter()
+                    .map(|failure| failure.code)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ))
+        }
     }
 }
 
@@ -213,6 +234,10 @@ pub(crate) trait KeyboardBackendFactory {
 
 pub(crate) trait AwElcBackend {
     fn interrupt_write(&mut self, data: &[u8]) -> Result<usize, BackendError>;
+
+    fn finish(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 pub(crate) trait AwElcBackendFactory {
@@ -671,7 +696,20 @@ fn execute_aw_elc_lock_held(
     let selection = select_aw_elc(&dmi, &devices)?;
     validate_aw_elc_live_profile(&dmi)?;
     let mut backend = factory.acquire(&selection).map_err(map_acquisition_error)?;
-    dispatch_aw_elc(canonical, frames, &mut *backend).map_err(mark_transport_attempted)
+    let dispatched = dispatch_aw_elc(canonical, frames, &mut *backend);
+    let cleanup = backend.finish();
+    match (dispatched, cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(result), Err(cleanup)) => Err(mark_transport_attempted(with_completed_steps(
+            backend_error("cleanup", cleanup),
+            result.steps.len(),
+        ))),
+        (Err(primary), Ok(())) => Err(mark_transport_attempted(primary)),
+        (Err(mut primary), Err(cleanup)) => {
+            primary.message = format!("{}; cleanup failed ({})", primary.message, cleanup.code);
+            Err(mark_transport_attempted(primary))
+        }
+    }
 }
 
 fn regenerate_keyboard(
