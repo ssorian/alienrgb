@@ -1,5 +1,5 @@
 # Alienware m16 R2 per-key keyboard, interface 00 only (0d62:d2b1)
-SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ENV{ID_VENDOR_ID}=="0d62", ENV{ID_MODEL_ID}=="d2b1", ENV{ID_USB_INTERFACE_NUM}=="00", ATTRS{idVendor}=="0d62", ATTRS{idProduct}=="d2b1", MODE:="0660", TAG+="uaccess"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ENV{ID_VENDOR_ID}=="0d62", ENV{ID_MODEL_ID}=="d2b1", ENV{ID_USB_INTERFACE_NUM}=="00", ATTRS{idVendor}=="0d62", ATTRS{idProduct}=="d2b1", GROUP:="alienrgb", MODE:="0660", TAG+="uaccess"
 
 # Alienware m16 R2 AW-ELC USB device only (187c:0551), requiring its HID 03/00/00 interface signature
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_VENDOR_ID}=="187c", ENV{ID_MODEL_ID}=="0551", ENV{ID_USB_INTERFACES}=="*:030000:*", ATTR{idVendor}=="187c", ATTR{idProduct}=="0551", ATTR{bDeviceClass}=="00", MODE:="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_VENDOR_ID}=="187c", ENV{ID_MODEL_ID}=="0551", ENV{ID_USB_INTERFACES}=="*:030000:*", ATTR{idVendor}=="187c", ATTR{idProduct}=="0551", ATTR{bDeviceClass}=="00", GROUP:="alienrgb", MODE:="0660", TAG+="uaccess"

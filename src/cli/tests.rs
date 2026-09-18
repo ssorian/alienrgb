@@ -1636,3 +1636,42 @@ impl LiveSetAllExecutor for FakeSetAllExecutor {
 fn strings<'a>(values: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
     values.iter().map(|value| (*value).to_string())
 }
+
+#[test]
+fn pre_login_boot_restore_contract_uses_the_unmodified_helper_and_group_access() {
+    let boot_unit = include_str!("../../contrib/systemd/alienrgb-boot@.service");
+    for directive in [
+        "User=%i",
+        "SupplementaryGroups=alienrgb",
+        "Type=oneshot",
+        "ExecStart=/usr/local/libexec/alienrgb-resume",
+        "TimeoutStartSec=120s",
+        "Before=display-manager.service",
+        "WantedBy=graphical.target",
+    ] {
+        assert!(boot_unit.contains(directive), "missing {directive:?}");
+    }
+
+    let resume_unit = include_str!("../../contrib/systemd/alienrgb-resume@.service");
+    assert!(resume_unit.contains("SupplementaryGroups=alienrgb"));
+
+    let rules = include_str!("../../contrib/udev/70-alienrgb.rules");
+    let matches = rules
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 2);
+    for rule in &matches {
+        assert!(
+            rule.contains("GROUP:=\"alienrgb\""),
+            "missing group: {rule}"
+        );
+        assert!(rule.contains("MODE:=\"0660\""), "missing mode: {rule}");
+        assert!(
+            rule.contains("TAG+=\"uaccess\""),
+            "missing uaccess tag: {rule}"
+        );
+    }
+    assert!(matches[0].contains("ENV{ID_USB_INTERFACE_NUM}==\"00\""));
+    assert!(matches[1].contains("ENV{ID_USB_INTERFACES}==\"*:030000:*\""));
+}
