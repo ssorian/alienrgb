@@ -1472,6 +1472,150 @@ fn set_all_confirmation_matrix_is_strict() {
     .is_err());
 }
 
+#[test]
+fn set_all_state_is_saved_only_after_complete_live_success() {
+    let state = SharedState::default();
+    let mut executor = FakeSetAllExecutor {
+        state: state.clone(),
+        calls: 0,
+        outcome: SetAllExecutionOutcome::successful(),
+    };
+    let mut warnings = FakeWarnings::new(state.clone());
+    let mut store = FakeSetAllStateStore::new(state.clone());
+    let dry_run = parse(strings(&["set-all", "--color", "Aa00Ff", "--dry-run"])).unwrap();
+    run_set_all_with_services_and_state(dry_run, &mut executor, &mut warnings, &mut store).unwrap();
+    assert_eq!(executor.calls, 0);
+    assert!(store.colors.is_empty());
+
+    let mut executor = FakeSetAllExecutor {
+        state: state.clone(),
+        calls: 0,
+        outcome: SetAllExecutionOutcome::failed_for_test(2, 33),
+    };
+    let apply = set_all_apply_cli("aa00ff");
+    let error =
+        run_set_all_with_services_and_state(apply, &mut executor, &mut warnings, &mut store)
+            .unwrap_err();
+    assert_eq!(error.code, "set_all_partial_failure");
+    assert!(store.colors.is_empty());
+
+    let mut executor = FakeSetAllExecutor {
+        state: state.clone(),
+        calls: 0,
+        outcome: SetAllExecutionOutcome { stages: Vec::new() },
+    };
+    let error = run_set_all_with_services_and_state(
+        set_all_apply_cli("aa00ff"),
+        &mut executor,
+        &mut warnings,
+        &mut store,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "incomplete_set_all_execution");
+    assert!(store.colors.is_empty());
+
+    let mut executor = FakeSetAllExecutor {
+        state: state.clone(),
+        calls: 0,
+        outcome: SetAllExecutionOutcome::successful(),
+    };
+    run_set_all_with_services_and_state(
+        set_all_apply_cli("Aa00Ff"),
+        &mut executor,
+        &mut warnings,
+        &mut store,
+    )
+    .unwrap();
+    assert_eq!(store.colors, [Rgb::new(0xaa, 0x00, 0xff)]);
+    assert_eq!(
+        state.borrow().events.last(),
+        Some(&"state_persist"),
+        "state must be persisted only after the transport executor completes"
+    );
+}
+
+#[test]
+fn resume_helper_matches_only_the_complete_ready_for_writes_json_line() {
+    let helper = include_str!("../../contrib/systemd/alienrgb-resume");
+    assert!(helper.contains(
+        "grep -Eq '^[[:space:]]*\"ready_for_writes\"[[:space:]]*:[[:space:]]*true[[:space:]]*,?[[:space:]]*$'"
+    ));
+    assert!(!helper.contains("grep -Eq '\"ready_for_writes\"[[:space:]]*:[[:space:]]*true'"));
+}
+
+#[test]
+fn set_all_success_reports_state_persistence_failure_explicitly() {
+    let state = SharedState::default();
+    let mut executor = FakeSetAllExecutor {
+        state: state.clone(),
+        calls: 0,
+        outcome: SetAllExecutionOutcome::successful(),
+    };
+    let mut warnings = FakeWarnings::new(state.clone());
+    let mut store = FakeSetAllStateStore::new(state);
+    store.fail = true;
+
+    let error = run_set_all_with_services_and_state(
+        set_all_apply_cli("010203"),
+        &mut executor,
+        &mut warnings,
+        &mut store,
+    )
+    .unwrap_err();
+
+    assert_eq!(executor.calls, 1);
+    assert_eq!(store.calls, 1);
+    assert_eq!(error.code, "resume_state_persist_failed");
+    assert!(error.transport_performed);
+    assert!(error.message.contains("last successful set-all state"));
+}
+
+fn set_all_apply_cli(color: &str) -> Cli {
+    parse(strings(&[
+        "set-all",
+        "--color",
+        color,
+        "--apply",
+        "--experimental",
+        "--confirm-live-write",
+        "--confirm-power-profile-write",
+        "--confirm-set-all-write",
+        "--json",
+    ]))
+    .unwrap()
+}
+
+struct FakeSetAllStateStore {
+    state: SharedState,
+    calls: usize,
+    colors: Vec<Rgb>,
+    fail: bool,
+}
+
+impl FakeSetAllStateStore {
+    fn new(state: SharedState) -> Self {
+        Self {
+            state,
+            calls: 0,
+            colors: Vec::new(),
+            fail: false,
+        }
+    }
+}
+
+impl crate::resume_state::SetAllStateStore for FakeSetAllStateStore {
+    fn persist_color(&mut self, color: Rgb) -> std::io::Result<()> {
+        self.calls += 1;
+        self.colors.push(color);
+        self.state.borrow_mut().events.push("state_persist");
+        if self.fail {
+            Err(std::io::Error::other("forced state failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 struct FakeSetAllExecutor {
     state: SharedState,
     calls: usize,
@@ -1491,4 +1635,43 @@ impl LiveSetAllExecutor for FakeSetAllExecutor {
 
 fn strings<'a>(values: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
     values.iter().map(|value| (*value).to_string())
+}
+
+#[test]
+fn pre_login_boot_restore_contract_uses_the_unmodified_helper_and_group_access() {
+    let boot_unit = include_str!("../../contrib/systemd/alienrgb-boot@.service");
+    for directive in [
+        "User=%i",
+        "SupplementaryGroups=alienrgb",
+        "Type=oneshot",
+        "ExecStart=/usr/local/libexec/alienrgb-resume",
+        "TimeoutStartSec=120s",
+        "Before=display-manager.service",
+        "WantedBy=graphical.target",
+    ] {
+        assert!(boot_unit.contains(directive), "missing {directive:?}");
+    }
+
+    let resume_unit = include_str!("../../contrib/systemd/alienrgb-resume@.service");
+    assert!(resume_unit.contains("SupplementaryGroups=alienrgb"));
+
+    let rules = include_str!("../../contrib/udev/70-alienrgb.rules");
+    let matches = rules
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 2);
+    for rule in &matches {
+        assert!(
+            rule.contains("GROUP:=\"alienrgb\""),
+            "missing group: {rule}"
+        );
+        assert!(rule.contains("MODE:=\"0660\""), "missing mode: {rule}");
+        assert!(
+            rule.contains("TAG+=\"uaccess\""),
+            "missing uaccess tag: {rule}"
+        );
+    }
+    assert!(matches[0].contains("ENV{ID_USB_INTERFACE_NUM}==\"00\""));
+    assert!(matches[1].contains("ENV{ID_USB_INTERFACES}==\"*:030000:*\""));
 }

@@ -12,6 +12,7 @@ use crate::presentation::{
 };
 use crate::profile::{DescriptorEvidence, CONFIRMED_BIOS_VERSION};
 use crate::protocol::{api_v4, api_v5, power_v4, LogicalColor, Rgb};
+use crate::resume_state::{SetAllStateStore, SystemSetAllStateStore};
 use crate::sysfs;
 use crate::targets::{
     chassis_targets, expand_chassis_targets, expand_keyboard_targets, keyboard_targets,
@@ -316,10 +317,21 @@ pub fn run(cli: Cli) -> Result<String, Box<dyn Error>> {
         .map_err(|error| Box::new(error) as Box<dyn Error>),
         CliCommand::SetAll { .. } => {
             let json = cli.json;
+            let mut state_store = SystemSetAllStateStore;
             if json {
-                run_set_all_with_services(cli, &mut SystemLiveSetAllExecutor, &mut DiscardWarnings)
+                run_set_all_with_services_and_state(
+                    cli,
+                    &mut SystemLiveSetAllExecutor,
+                    &mut DiscardWarnings,
+                    &mut state_store,
+                )
             } else {
-                run_set_all_with_services(cli, &mut SystemLiveSetAllExecutor, &mut StderrWarnings)
+                run_set_all_with_services_and_state(
+                    cli,
+                    &mut SystemLiveSetAllExecutor,
+                    &mut StderrWarnings,
+                    &mut state_store,
+                )
             }
             .map_err(|error| Box::new(error) as Box<dyn Error>)
         }
@@ -396,8 +408,13 @@ pub fn run_with_inventory(
         CliCommand::SetAll { .. } => {
             let mut executor = DisabledLiveSetAllExecutor;
             let mut warnings = DiscardWarnings;
-            run_set_all_with_services(cli, &mut executor, &mut warnings)
-                .map_err(|error| Box::new(error) as Box<dyn Error>)
+            run_set_all_with_services_and_state(
+                cli,
+                &mut executor,
+                &mut warnings,
+                &mut DiscardSetAllStateStore,
+            )
+            .map_err(|error| Box::new(error) as Box<dyn Error>)
         },
         CliCommand::PowerProfile { apply: true, .. } => Err(cli_error(
             "live power-profile apply requires the sealed runtime executor; injected inventory is dry-run only",
@@ -474,6 +491,14 @@ struct DiscardWarnings;
 
 impl WarningSink for DiscardWarnings {
     fn warn(&mut self, _message: &str) {}
+}
+
+struct DiscardSetAllStateStore;
+
+impl SetAllStateStore for DiscardSetAllStateStore {
+    fn persist_color(&mut self, _color: Rgb) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -618,10 +643,20 @@ fn power_profile_report(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn run_set_all_with_services(
     cli: Cli,
     executor: &mut impl LiveSetAllExecutor,
     warnings: &mut impl WarningSink,
+) -> Result<String, CliRunError> {
+    run_set_all_with_services_and_state(cli, executor, warnings, &mut DiscardSetAllStateStore)
+}
+
+pub(crate) fn run_set_all_with_services_and_state(
+    cli: Cli,
+    executor: &mut impl LiveSetAllExecutor,
+    warnings: &mut impl WarningSink,
+    state_store: &mut impl SetAllStateStore,
 ) -> Result<String, CliRunError> {
     let CliCommand::SetAll {
         color,
@@ -673,9 +708,10 @@ pub(crate) fn run_set_all_with_services(
             });
         }
     };
+    let completed_canonical_profile = set_all_completed_canonically(&outcome);
     report.transport_attempted = outcome.transport_attempted();
     report.transport_performed = outcome.transport_performed();
-    report.overall_status = Some(if outcome.completed() {
+    report.overall_status = Some(if completed_canonical_profile {
         CompoundStatus::Completed
     } else {
         CompoundStatus::PartialFailure
@@ -708,28 +744,61 @@ pub(crate) fn run_set_all_with_services(
             }
         })
         .collect();
-    if !outcome.completed() {
-        let failed = report
+    if !completed_canonical_profile {
+        if let Some(failed) = report
             .stages
             .iter()
             .find(|stage| stage.status == CompoundStageStatus::Failed)
-            .expect("incomplete outcome has failure");
-        let failure = failed.failure.as_ref().expect("failed stage has failure");
-        let message = format!(
-            "set-all failed at {} after {}/{} steps: {}",
-            failed.stage, failed.completed_steps, failed.expected_steps, failure.message
-        );
+        {
+            let failure = failed.failure.as_ref().expect("failed stage has failure");
+            let message = format!(
+                "set-all failed at {} after {}/{} steps: {}",
+                failed.stage, failed.completed_steps, failed.expected_steps, failure.message
+            );
+            return Err(CliRunError {
+                code: "set_all_partial_failure",
+                message,
+                transport_performed: report.transport_performed,
+                report: Some(Box::new(report)),
+            });
+        }
         return Err(CliRunError {
-            code: "set_all_partial_failure",
-            message,
+            code: "incomplete_set_all_execution",
+            message: "set-all executor returned a non-canonical completion receipt; state was not persisted".into(),
             transport_performed: report.transport_performed,
             report: Some(Box::new(report)),
         });
     }
+    state_store.persist_color(color).map_err(|error| CliRunError {
+        code: "resume_state_persist_failed",
+        message: format!("set-all completed all 49 operations, but failed to persist the last successful set-all state: {error}"),
+        transport_performed: true,
+        report: None,
+    })?;
     render(cli.json, &report, || {
         crate::presentation::set_all_human(&report)
     })
     .map_err(|error| CliRunError::validation("render_failed", error.to_string()))
+}
+
+fn set_all_completed_canonically(outcome: &SetAllExecutionOutcome) -> bool {
+    const EXPECTED: [(&str, usize); 3] = [
+        ("keyboard", 11),
+        ("aw_static_touchpad_back", 4),
+        ("power_profile", 34),
+    ];
+    outcome.completed()
+        && outcome.stages.len() == EXPECTED.len()
+        && outcome
+            .stages
+            .iter()
+            .zip(EXPECTED)
+            .all(|(stage, (name, steps))| {
+                stage.name == name
+                    && stage.expected_steps == steps
+                    && stage.completed_steps == steps
+                    && stage.transport_attempted
+            })
 }
 
 fn preflight_stage_records(error: &CliRunError) -> Vec<CompoundStageRecord> {

@@ -1,0 +1,20 @@
+[Unit]
+Description=Restore alienrgb profile before graphical login for user %i
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+User=%i
+SupplementaryGroups=alienrgb
+ExecStart=/usr/local/libexec/alienrgb-resume
+TimeoutStartSec=120s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=graphical.target

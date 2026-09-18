@@ -1130,6 +1130,47 @@ fn unsupported_dmi() -> DmiIdentity {
     }
 }
 
+#[test]
+fn set_all_dry_run_and_argument_failure_never_create_resume_state() {
+    let binary = env!("CARGO_BIN_EXE_alienrgb");
+    let unique = format!(
+        "alienrgb-no-state-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let state_home = std::env::temp_dir().join(unique);
+    let state_file = state_home.join("alienrgb/last-set-all-color");
+
+    let dry_run = std::process::Command::new(binary)
+        .args(["set-all", "--color", "abcdef", "--dry-run"])
+        .env("XDG_STATE_HOME", &state_home)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(dry_run.status.success());
+    assert!(!state_file.exists());
+
+    let rejected = std::process::Command::new(binary)
+        .args([
+            "set-all",
+            "--color",
+            "abcdef",
+            "--apply",
+            "--experimental",
+            "--confirm-live-write",
+            "--confirm-power-profile-write",
+        ])
+        .env("XDG_STATE_HOME", &state_home)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(!state_file.exists());
+}
+
 fn args<const N: usize>(values: [&str; N]) -> std::vec::IntoIter<String> {
     values
         .into_iter()

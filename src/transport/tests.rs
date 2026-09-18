@@ -1,5 +1,6 @@
 use super::aw_elc::{
-    validate_aw_opened, AwInterfaceEvidence, AwOpenedEvidence, DriverState, EndpointEvidence,
+    acquire_aw_elc_handoff, validate_aw_opened, AwElcHandoff, AwInterfaceEvidence,
+    AwOpenedEvidence, DriverState, EndpointEvidence,
 };
 use super::keyboard::{
     validate_keyboard_enumeration, validate_opened_keyboard, KeyboardEnumerationRecord,
@@ -683,7 +684,7 @@ fn aw_opened_identity_interface_endpoints_and_driver_state_fail_closed() {
         ExecutionErrorCode::EndpointDrift,
     );
     let mut active = valid.clone();
-    active.driver_before_claim = DriverState::Active;
+    active.driver_after_claim = DriverState::Active;
     assert_code(&selection, &active, ExecutionErrorCode::DriverActive);
     let mut unknown = valid;
     unknown.driver_after_claim = DriverState::Unknown;
@@ -1494,4 +1495,464 @@ fn validation_state_remains_mapping_derived_only() {
             .validation,
         ValidationState::MappingDerivedUnvalidated
     );
+}
+
+#[test]
+fn aw_handoff_active_success_is_detach_claim_write_release_attach() {
+    let selection = aw_selection();
+    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let mut backend = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(state.clone(), HandoffConfig::active()),
+    )
+    .unwrap();
+    backend.interrupt_write(&[0; 33]).unwrap();
+    backend.finish().unwrap();
+    assert_eq!(
+        state.borrow().events,
+        ["detach", "claim", "write", "release", "attach"]
+    );
+}
+
+#[test]
+fn aw_handoff_inactive_never_detaches_or_reattaches() {
+    let selection = aw_selection();
+    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let mut backend = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(state.clone(), HandoffConfig::default()),
+    )
+    .unwrap();
+    backend.interrupt_write(&[0; 33]).unwrap();
+    backend.finish().unwrap();
+    assert_eq!(state.borrow().events, ["claim", "write", "release"]);
+}
+
+#[test]
+fn aw_handoff_detach_failure_never_claims_or_writes() {
+    let selection = aw_selection();
+    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let error = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(
+            state.clone(),
+            HandoffConfig {
+                active_before: true,
+                fail_detach: true,
+                ..HandoffConfig::default()
+            },
+        ),
+    )
+    .err()
+    .unwrap();
+    assert!(error.code.contains("aw_elc_detach_failed"));
+    assert!(error.code.contains("remains active"));
+    assert_eq!(state.borrow().events, ["detach"]);
+    assert_eq!(state.borrow().driver_state_checks, 2);
+}
+
+#[test]
+fn aw_handoff_detach_error_with_inactive_driver_reattaches_without_claiming() {
+    let selection = aw_selection();
+    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let error = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(
+            state.clone(),
+            HandoffConfig {
+                active_before: true,
+                fail_detach: true,
+                detach_error_state: Some(DriverState::Inactive),
+                ..HandoffConfig::default()
+            },
+        ),
+    )
+    .err()
+    .unwrap();
+    assert!(error.code.contains("aw_elc_detach_failed"));
+    assert!(error.code.contains("attach cleanup succeeded"));
+    assert_eq!(state.borrow().events, ["detach", "attach"]);
+    assert_eq!(state.borrow().driver_state_checks, 2);
+}
+
+#[test]
+fn aw_handoff_detach_error_with_unknown_driver_reports_uncertainty_without_attach() {
+    let selection = aw_selection();
+    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let error = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(
+            state.clone(),
+            HandoffConfig {
+                active_before: true,
+                fail_detach: true,
+                detach_error_state: Some(DriverState::Unknown),
+                ..HandoffConfig::default()
+            },
+        ),
+    )
+    .err()
+    .unwrap();
+    assert!(error.code.contains("driver state is unknown"));
+    assert_eq!(state.borrow().events, ["detach"]);
+    assert_eq!(state.borrow().driver_state_checks, 2);
+}
+
+#[test]
+fn aw_handoff_claim_or_postclaim_failure_cleans_up_before_returning() {
+    for config in [
+        HandoffConfig {
+            active_before: true,
+            fail_claim: true,
+            ..HandoffConfig::default()
+        },
+        HandoffConfig {
+            active_before: true,
+            invalid_postclaim: true,
+            ..HandoffConfig::default()
+        },
+    ] {
+        let selection = aw_selection();
+        let state = Rc::new(RefCell::new(HandoffState::default()));
+        assert!(
+            acquire_aw_elc_handoff(&selection, FakeAwHandoff::new(state.clone(), config)).is_err()
+        );
+        let events = &state.borrow().events;
+        assert_eq!(events[0..2], ["detach", "claim"]);
+        assert_eq!(events.last(), Some(&"attach"));
+        assert!(
+            events == &["detach", "claim", "attach"]
+                || events == &["detach", "claim", "release", "attach"]
+        );
+    }
+}
+
+#[test]
+fn aw_handoff_postclaim_failure_preserves_release_and_attach_failures() {
+    let selection = aw_selection();
+    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let error = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(
+            state.clone(),
+            HandoffConfig {
+                active_before: true,
+                invalid_postclaim: true,
+                fail_release: true,
+                fail_attach: true,
+                ..HandoffConfig::default()
+            },
+        ),
+    )
+    .err()
+    .unwrap();
+    assert!(error.code.contains("aw_elc_postclaim_validation_failed"));
+    assert!(error.code.contains("aw_elc_release_failed"));
+    assert!(error.code.contains("aw_elc_reattach_failed"));
+    assert_eq!(
+        state.borrow().events,
+        ["detach", "claim", "release", "attach"]
+    );
+}
+
+#[test]
+fn aw_handoff_write_and_short_failure_cleanup_without_retry() {
+    for config in [
+        HandoffConfig {
+            active_before: true,
+            fail_write: true,
+            ..HandoffConfig::default()
+        },
+        HandoffConfig {
+            active_before: true,
+            short_write: true,
+            ..HandoffConfig::default()
+        },
+    ] {
+        let selection = aw_selection();
+        let state = Rc::new(RefCell::new(HandoffState::default()));
+        let mut backend =
+            acquire_aw_elc_handoff(&selection, FakeAwHandoff::new(state.clone(), config)).unwrap();
+        let write = backend.interrupt_write(&[0; 33]);
+        assert!(write.is_err() || write.unwrap() == 32);
+        backend.finish().unwrap();
+        assert_eq!(
+            state.borrow().events,
+            ["detach", "claim", "write", "release", "attach"]
+        );
+    }
+}
+
+#[test]
+fn aw_handoff_write_and_short_failure_preserve_progress_when_cleanup_fails() {
+    for config in [
+        HandoffConfig {
+            active_before: true,
+            fail_write: true,
+            fail_release: true,
+            fail_attach: true,
+            ..HandoffConfig::default()
+        },
+        HandoffConfig {
+            active_before: true,
+            short_write: true,
+            fail_release: true,
+            fail_attach: true,
+            ..HandoffConfig::default()
+        },
+    ] {
+        let mut discovery = FakeDiscovery::supported();
+        let state = Rc::new(RefCell::new(HandoffState::default()));
+        let mut factory = HandoffFactory {
+            state: state.clone(),
+            config,
+        };
+        let error = execute_aw_elc(
+            prepare_aw_elc(vec![LogicalColor::new(0, Rgb::new(1, 2, 3))]).unwrap(),
+            &mut discovery,
+            &mut factory,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.code,
+            ExecutionErrorCode::BackendFailed | ExecutionErrorCode::ShortTransfer
+        ));
+        assert_eq!(error.completed_steps(), 0);
+        assert!(error.transport_attempted);
+        assert!(error.message().contains("aw_elc_release_failed"));
+        assert!(error.message().contains("aw_elc_reattach_failed"));
+        assert_eq!(
+            state.borrow().events,
+            ["detach", "claim", "write", "release", "attach"]
+        );
+    }
+}
+
+#[test]
+fn aw_handoff_release_failure_still_attempts_reattach_and_drop_is_fallback() {
+    let selection = aw_selection();
+    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let mut backend = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(
+            state.clone(),
+            HandoffConfig {
+                active_before: true,
+                fail_release: true,
+                ..HandoffConfig::default()
+            },
+        ),
+    )
+    .unwrap();
+    backend.interrupt_write(&[0; 33]).unwrap();
+    assert_eq!(backend.finish().unwrap_err().code, "aw_elc_release_failed");
+    assert_eq!(
+        state.borrow().events,
+        ["detach", "claim", "write", "release", "attach"]
+    );
+
+    let both_fail_state = Rc::new(RefCell::new(HandoffState::default()));
+    let mut backend = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(
+            both_fail_state.clone(),
+            HandoffConfig {
+                active_before: true,
+                fail_release: true,
+                fail_attach: true,
+                ..HandoffConfig::default()
+            },
+        ),
+    )
+    .unwrap();
+    let error = backend.finish().unwrap_err();
+    assert!(error.code.contains("aw_elc_release_failed"));
+    assert!(error.code.contains("aw_elc_reattach_failed"));
+    assert_eq!(
+        both_fail_state.borrow().events,
+        ["detach", "claim", "release", "attach"]
+    );
+
+    let fallback_state = Rc::new(RefCell::new(HandoffState::default()));
+    let backend = acquire_aw_elc_handoff(
+        &selection,
+        FakeAwHandoff::new(fallback_state.clone(), HandoffConfig::active()),
+    )
+    .unwrap();
+    drop(backend);
+    assert_eq!(
+        fallback_state.borrow().events,
+        ["detach", "claim", "release", "attach"]
+    );
+}
+
+#[test]
+fn aw_handoff_attach_failure_after_writes_preserves_transport_progress() {
+    let mut discovery = FakeDiscovery::supported();
+    let state = Rc::new(RefCell::new(HandoffState::default()));
+    let mut factory = HandoffFactory {
+        state: state.clone(),
+        config: HandoffConfig {
+            active_before: true,
+            fail_attach: true,
+            ..HandoffConfig::default()
+        },
+    };
+    let error = execute_aw_elc(
+        prepare_aw_elc(vec![LogicalColor::new(0, Rgb::new(1, 2, 3))]).unwrap(),
+        &mut discovery,
+        &mut factory,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ExecutionErrorCode::BackendFailed);
+    assert_eq!(error.completed_steps(), 4);
+    assert!(error.transport_attempted);
+    assert!(error.message().contains("aw_elc_reattach_failed"));
+    assert_eq!(
+        state.borrow().events,
+        ["detach", "claim", "write", "write", "write", "write", "release", "attach"]
+    );
+}
+
+fn aw_selection() -> AwElcSelection {
+    AwElcSelection {
+        bus_number: 3,
+        port_path: vec![2, 4],
+        serial: Some("bound-serial".into()),
+    }
+}
+
+#[derive(Clone, Default)]
+struct HandoffConfig {
+    active_before: bool,
+    fail_detach: bool,
+    detach_error_state: Option<DriverState>,
+    fail_claim: bool,
+    invalid_postclaim: bool,
+    fail_write: bool,
+    short_write: bool,
+    fail_release: bool,
+    fail_attach: bool,
+}
+
+impl HandoffConfig {
+    fn active() -> Self {
+        Self {
+            active_before: true,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Default)]
+struct HandoffState {
+    events: Vec<&'static str>,
+    driver_state_checks: usize,
+}
+
+struct FakeAwHandoff {
+    state: Rc<RefCell<HandoffState>>,
+    config: HandoffConfig,
+    claimed: bool,
+    detach_attempted: bool,
+}
+
+impl FakeAwHandoff {
+    fn new(state: Rc<RefCell<HandoffState>>, config: HandoffConfig) -> Self {
+        Self {
+            state,
+            config,
+            claimed: false,
+            detach_attempted: false,
+        }
+    }
+}
+
+impl AwElcHandoff for FakeAwHandoff {
+    fn evidence(&mut self, _selection: &AwElcSelection) -> Result<AwOpenedEvidence, BackendError> {
+        let mut evidence = valid_aw_evidence();
+        if self.claimed && self.config.invalid_postclaim {
+            evidence.interface.protocol = 1;
+        }
+        Ok(evidence)
+    }
+
+    fn driver_state(&mut self) -> DriverState {
+        self.state.borrow_mut().driver_state_checks += 1;
+        if self.detach_attempted && self.config.fail_detach {
+            self.config
+                .detach_error_state
+                .unwrap_or(DriverState::Active)
+        } else if self.claimed || !self.config.active_before {
+            DriverState::Inactive
+        } else {
+            DriverState::Active
+        }
+    }
+
+    fn detach_kernel_driver(&mut self) -> Result<(), BackendError> {
+        self.state.borrow_mut().events.push("detach");
+        self.detach_attempted = true;
+        if self.config.fail_detach {
+            Err(BackendError::new("aw_elc_detach_failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn claim_interface(&mut self) -> Result<(), BackendError> {
+        self.state.borrow_mut().events.push("claim");
+        if self.config.fail_claim {
+            Err(BackendError::new("aw_elc_claim_failed"))
+        } else {
+            self.claimed = true;
+            Ok(())
+        }
+    }
+
+    fn release_interface(&mut self) -> Result<(), BackendError> {
+        self.state.borrow_mut().events.push("release");
+        if self.config.fail_release {
+            Err(BackendError::new("aw_elc_release_failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn attach_kernel_driver(&mut self) -> Result<(), BackendError> {
+        self.state.borrow_mut().events.push("attach");
+        if self.config.fail_attach {
+            Err(BackendError::new("aw_elc_reattach_failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn interrupt_write(&mut self, _data: &[u8]) -> Result<usize, BackendError> {
+        self.state.borrow_mut().events.push("write");
+        if self.config.fail_write {
+            Err(BackendError::new("fake_aw_write_failed"))
+        } else if self.config.short_write {
+            Ok(32)
+        } else {
+            Ok(33)
+        }
+    }
+}
+
+struct HandoffFactory {
+    state: Rc<RefCell<HandoffState>>,
+    config: HandoffConfig,
+}
+
+impl AwElcBackendFactory for HandoffFactory {
+    fn acquire(
+        &mut self,
+        selection: &AwElcSelection,
+    ) -> Result<Box<dyn AwElcBackend>, BackendError> {
+        Ok(Box::new(acquire_aw_elc_handoff(
+            selection,
+            FakeAwHandoff::new(self.state.clone(), self.config.clone()),
+        )?))
+    }
 }

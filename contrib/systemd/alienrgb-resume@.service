@@ -1,0 +1,23 @@
+[Unit]
+Description=Restore alienrgb profile after system resume for user %i
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+User=%i
+SupplementaryGroups=alienrgb
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/libexec/alienrgb-resume
+TimeoutStopSec=120s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=sleep.target
